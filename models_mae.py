@@ -18,7 +18,7 @@ import transformers
 
 from timm.models.vision_transformer import PatchEmbed, Block
 from util.pos_embed import get_2d_sincos_pos_embed
-from einops import rearrange
+from einops import rearrange, repeat    
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -724,7 +724,6 @@ class lang_cond_MAE_add_multimodal_mask(nn.Module):
         loss = self.forward_loss(x, pred, mask)
         return loss, pred, mask
 
-
 class lang_gen_MAE(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
@@ -746,6 +745,7 @@ class lang_gen_MAE(nn.Module):
         self.mae_weight = mae_weight
         self.lm_weight = lm_weight
         self.eps = eps
+        self.max_lang_len = max_lang_len
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim) # 将图像划分为块，最终使每一个patch变成一个embed_dim长度的向量
@@ -794,8 +794,7 @@ class lang_gen_MAE(nn.Module):
 
         # Register this once... we'll multiply by padding masks prior to feeding to Transformer
         self.register_buffer("prefix_mask", prefix_mask.view(1, 1, total_seq, total_seq))
-
-
+        
         self.norm_pix_loss = norm_pix_loss
 
         self.initialize_weights()
@@ -928,7 +927,95 @@ class lang_gen_MAE(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore
+    
+    def score(self, imgs: torch.Tensor, langs: torch.Tensor, lang_masks: torch.Tensor) -> torch.Tensor:
+        """
+        Given an example 0-K pair and a set of k language instructions, output scores under the generative language
+        model for each instruction.
 
+        :param imgs: 0-K pairs --> [1, 3, 224, 224]
+        :param langs: Tokenized language input --> [k, seq]
+        :param lang_masks: Language padding masks --> [k, seq]
+
+        :return: [1, k] Tensor of score for matching img and lang. As score is small, img and lang match more
+        """
+        # Blank out the "encoder" language --> just [<CLS> = 101, 0 ...] ,101 的原因是在bert中101通常代表着起始
+        blank_lang = torch.zeros(1, self.max_lang_len, dtype=torch.int64, device=imgs.device)
+        blank_lang_mask = torch.zeros(1, self.max_lang_len, dtype=torch.int64, device=imgs.device)
+        blank_lang[0][0], blank_lang_mask[0][0] = 101, 1
+
+        lang_embeddings = self.encode_language(blank_lang, blank_lang_mask)
+        # print(lang_embeddings)
+        projected_lang = self.lang2encoder(lang_embeddings)
+
+        # Patchify, broadcast position embedding
+        x = self.patch_embed(imgs) # [N, L, D]
+        x = x + self.pos_embed[:, 1:, :]
+        
+        # we don't need mask in score function
+
+        # append cls token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(imgs.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        
+        # create "dummy" visible mask, concatenate image patches & language, feed to Transformer
+
+        visible_mask = torch.ones_like(x[..., -1], dtype=blank_lang_mask.dtype) # 删去x的最后一个维度 x[N, L, embed_dim], visible_patch[N,L]
+        multimodal_embedding = torch.cat([x, projected_lang], dim=1)  # Merge on sequence length...
+        multimodal_mask = torch.cat([visible_mask,  blank_lang_mask], dim=1)  # Merge on sequence length...
+
+        # apply Transformer blocks
+        for blk in self.blocks:
+            multimodal_embedding = blk(multimodal_embedding, multimodal_mask)
+        multimodal_embedding = self.norm(multimodal_embedding)
+
+        
+        # Split multimodal embedding, remove language and return only the visible patches (+ optional <CLS> token)!
+        enc_patches = multimodal_embedding[:, :-blank_lang_mask.shape[-1], ...]
+
+        # === Encoder =>> Decoder Hand-Off ===
+        enc_patches = repeat(enc_patches, "b cseq embed -> (bsz b) cseq embed", bsz=langs.size(0))
+        lang_gen_embeddings = self.embed_language(langs)
+
+        # === Decoder Forward ===
+        x = self.decoder_embed(enc_patches) # [N, 196+1, decoder_embed_dim]
+        projected_lang_gen = self.lang2decoder(lang_gen_embeddings)
+
+       # add pos embed
+        x = x + self.decoder_pos_embed #[N, 196+1, decoder_embed_dim]
+
+        # add language -> create "mask" by multiply padding by self.prefix_mask
+        decoder_patches_mask = torch.ones_like(x[..., -1], dtype=lang_masks.dtype)
+        multimodal_embedding = torch.cat([x, projected_lang_gen], dim=1)  # Merge on sequence length...
+        multimodal_mask = torch.cat([decoder_patches_mask, lang_masks], dim=1)  # Merge on sequence length...
+
+
+        # 
+        prefix_padded_mask = multimodal_mask.unsqueeze(1).unsqueeze(2) * self.prefix_mask
+
+        # apply Transformer blocks
+        for blk in self.decoder_blocks:
+            multimodal_embedding = blk(multimodal_embedding, prefix_padded_mask)
+        multimodal_embedding = self.decoder_norm(multimodal_embedding)
+
+        # Split multimodal embedding into patches and language...
+        lang = multimodal_embedding[:, -lang_masks.shape[-1] :, ...]
+        generations = self.lang_prediction(lang)
+
+        # Compute cross-entropy loss (multiply by -1 for "final scoring") --> log-likelihood!
+        bsz, seq = langs.shape
+        lang_logits = rearrange(generations[:, :-1, ...], "bsz seq vocab -> (bsz seq) vocab")
+        lang_targets = rearrange(langs[:, 1:], "bsz seq -> (bsz seq)")
+        lang_loss_mask = lang_masks[:, :-1]  # Defined where valid...
+        ce_loss = F.cross_entropy(lang_logits, lang_targets, reduction="none")
+        per_token_loss = rearrange(ce_loss, "(bsz seq) -> bsz seq", bsz=bsz, seq=seq - 1)  # -1 because causal mask...
+
+        # Compute loss only on *non-padded* and *non-ignored* tokens...
+        lang_example_loss = (per_token_loss * lang_loss_mask).sum(dim=-1) / lang_loss_mask.sum(dim=-1)
+        print("lang_example_loss",lang_example_loss)
+        return lang_example_loss.detach()
+    
     def forward_encoder(self, x, lang_con, lang_con_mask, mask_ratio):
         """
         x: [N, c, h, w]
@@ -954,11 +1041,11 @@ class lang_gen_MAE(nn.Module):
         # create "dummy" visible mask, concatenate image patches & language, feed to Transformer
         """
         visible_mask: [N, 49+1]
-        lang_mask: [N, max_lang_len]
+        lang_con_mask: [N, max_lang_len]
         """
-        visible_mask = torch.ones_like(x[..., -1], dtype=lang_mask.dtype) # 删去x的最后一个维度 x[N, L, embed_dim], visible_patch[N,L]
+        visible_mask = torch.ones_like(x[..., -1], dtype=lang_con_mask.dtype) # 删去x的最后一个维度 x[N, L, embed_dim], visible_patch[N,L]
         multimodal_embedding = torch.cat([x, projected_lang], dim=1)  # Merge on sequence length...
-        multimodal_mask = torch.cat([visible_mask, lang_mask], dim=1)  # Merge on sequence length...
+        multimodal_mask = torch.cat([visible_mask, lang_con_mask], dim=1)  # Merge on sequence length...
 
         # apply Transformer blocks
         for blk in self.blocks:
@@ -967,7 +1054,7 @@ class lang_gen_MAE(nn.Module):
 
         
         # Split multimodal embedding, remove language and return only the visible patches (+ optional <CLS> token)!
-        x = multimodal_embedding[:, : -lang_mask.shape[-1], ...]
+        x = multimodal_embedding[:, : -lang_con_mask.shape[-1], ...]
         
         return x, mask, ids_restore
 
@@ -989,7 +1076,10 @@ class lang_gen_MAE(nn.Module):
         multimodal_embedding = torch.cat([x, projected_lang_gen], dim=1)  # Merge on sequence length...
         multimodal_mask = torch.cat([decoder_patches_mask, lang_gen_mask], dim=1)  # Merge on sequence length...
 
+        # 
+        # print("multimodal_mask",multimodal_mask.shape)
         prefix_padded_mask = multimodal_mask.unsqueeze(1).unsqueeze(2) * self.prefix_mask
+        # print("prefix_padded_mask", prefix_padded_mask.shape)
 
         # apply Transformer blocks
         for blk in self.decoder_blocks:
@@ -1340,16 +1430,15 @@ def lang_cond_MAE_large_patch16_dec512d8b(**kwargs):
 
 def lang_gen_MAE_base_patch16_dec512d8b(**kwargs):
     model = lang_gen_MAE(
-        vocab_size=10, max_lang_len=40,
+        vocab_size=30522, max_lang_len=40,
         patch_size=16, embed_dim=768, depth=12, num_heads=12,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-        language_model="distilbert-base-uncased",hf_cache="save_model/hf-cache",language_dim=768,
+        
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 def lang_gen_MAE_large_patch16_dec512d8b(**kwargs):
     model = lang_gen_MAE(
-        vocab_size=10, max_lang_len=40,
+        vocab_size=30522, max_lang_len=40,
         patch_size=16, embed_dim=1024, depth=24, num_heads=16,
         decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
         language_model="distilbert-base-uncased",hf_cache="save_model/hf-cache",language_dim=768,
@@ -1361,7 +1450,7 @@ def lang_gen_MAE_test_patch16_dec512d8b(**kwargs):
         vocab_size=30522,
         max_lang_len=40,
         patch_size=16, embed_dim=1024, depth=1, num_heads=1,
-        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        decoder_embed_dim=512, decoder_depth=1, decoder_num_heads=1,
         language_model="distilbert-base-uncased",hf_cache="save_model/hf-cache",language_dim=768,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
@@ -1448,13 +1537,12 @@ if __name__ =="__main__":
         input_tensor1 = preprocess(image1).unsqueeze(0) #[C, H, W] transform into [1, C, H, W]
         
         input_tensor = torch.cat([input_tensor, input_tensor1],dim=0)
-        print(input_tensor.shape)
         #文本------------------------------------------------------------------------
         lang = ["This is a malignant nodule","This thyroid module has a wider-than-tall shape,this nodule is solid,The margin of the nodules is unclear,The shape of the nodules is irregular,The echo of the nodules is uneven,The nodules are extremely hypoechoic,The nodule have not calcified"]
 
         tokens = model.tokenizer(lang, return_tensors='pt',max_length=40 ,padding="max_length",truncation=True )
         lang, lang_mask = tokens["input_ids"].to(device), tokens["attention_mask"].to(device)
-        print(lang_mask.shape)
+
         #---------------------------------------------------------------------------------
 
         loss, _,_ = model(input_tensor,lang,lang_mask)
@@ -1486,7 +1574,6 @@ if __name__ =="__main__":
         for testing vgen
         """
         model = lgen_MAE_test_patch16()
-    # print(model)
         model.to(device)
         model.eval()
         
@@ -1496,17 +1583,22 @@ if __name__ =="__main__":
         # 预处理图像
         input_tensor1 = preprocess(image1).unsqueeze(0) #[C, H, W] transform into [1, C, H, W]
         
-        # input_tensor = torch.cat([input_tensor, input_tensor1],dim=0)
-        # print(input_tensor.shape)
         #文本------------------------------------------------------------------------
-        # lang = ["This is a malignant nodule","This thyroid module has a wider-than-tall shape,this nodule is solid,The margin of the nodules is unclear,The shape of the nodules is irregular,The echo of the nodules is uneven,The nodules are extremely hypoechoic,The nodule have not calcified"]
+        langs = ["This is a malignant nodule","This thyroid module has a wider-than-tall shape,this nodule is solid,The margin of the nodules is unclear,The shape of the nodules is irregular,The echo of the nodules is uneven,The nodules are extremely hypoechoic,The nodule have not calcified"]
         lang = ["This is a malignant nodule"]
 
-        tokens = model.tokenizer(lang, return_tensors='pt',max_length=40 ,padding="max_length",truncation=True )
-        
-        lang, lang_mask = tokens["input_ids"].to(device), tokens["attention_mask"].to(device)
+        tokens = model.tokenizer(langs, return_tensors='pt',max_length=40 ,padding="max_length",truncation=True )
+        langs, langs_mask = tokens["input_ids"].to(device), tokens["attention_mask"].to(device)
+
+        token = model.tokenizer(lang, return_tensors='pt',max_length=40 ,padding="max_length",truncation=True )
+        lang, lang_mask = token["input_ids"].to(device), token["attention_mask"].to(device)
         # print("lang",lang)
         #---------------------------------------------------------------------------------
-
+        print("FPRWARD")
         loss, reconstruction_loss, lang_loss = model(input_tensor,lang,lang_mask,lang,lang_mask,torch.zeros(len(input_tensor)))
-        print(loss)
+        
+        print("SCORE")
+        score_loss = model.score(input_tensor,langs, langs_mask)
+        print(score_loss)
+
+        # print(model.prefix_mask.shape)
