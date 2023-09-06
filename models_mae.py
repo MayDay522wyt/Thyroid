@@ -151,7 +151,6 @@ class MaskedAutoencoderViT(nn.Module):
     def forward_encoder(self, x, mask_ratio):
         # embed patches
         x = self.patch_embed(x)
-        # print("xshape",x.shape)
         # add pos embed w/o cls token
         x = x + self.pos_embed[:, 1:, :]
 
@@ -162,12 +161,10 @@ class MaskedAutoencoderViT(nn.Module):
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        # print("plus cls token",x.shape)
         # apply Transformer blocks
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        # print("predict x",x.shape,mask.shape)
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
@@ -945,7 +942,6 @@ class lang_gen_MAE(nn.Module):
         blank_lang[0][0], blank_lang_mask[0][0] = 101, 1
 
         lang_embeddings = self.encode_language(blank_lang, blank_lang_mask)
-        # print(lang_embeddings)
         projected_lang = self.lang2encoder(lang_embeddings)
 
         # Patchify, broadcast position embedding
@@ -1013,7 +1009,6 @@ class lang_gen_MAE(nn.Module):
 
         # Compute loss only on *non-padded* and *non-ignored* tokens...
         lang_example_loss = (per_token_loss * lang_loss_mask).sum(dim=-1) / lang_loss_mask.sum(dim=-1)
-        print("lang_example_loss",lang_example_loss)
         return lang_example_loss.detach()
     
     def forward_encoder(self, x, lang_con, lang_con_mask, mask_ratio):
@@ -1021,12 +1016,10 @@ class lang_gen_MAE(nn.Module):
         x: [N, c, h, w]
         """
         lang_embeddings = self.encode_language(lang_con, lang_con_mask)
-        # print(lang_embeddings)
         projected_lang = self.lang2encoder(lang_embeddings)
 
         # embed patches
         x = self.patch_embed(x) # [N, L, D]
-        # print("xshape",x.shape)
         # add pos embed w/o cls token
         x = x + self.pos_embed[:, 1:, :]
 
@@ -1076,10 +1069,7 @@ class lang_gen_MAE(nn.Module):
         multimodal_embedding = torch.cat([x, projected_lang_gen], dim=1)  # Merge on sequence length...
         multimodal_mask = torch.cat([decoder_patches_mask, lang_gen_mask], dim=1)  # Merge on sequence length...
 
-        # 
-        # print("multimodal_mask",multimodal_mask.shape)
         prefix_padded_mask = multimodal_mask.unsqueeze(1).unsqueeze(2) * self.prefix_mask
-        # print("prefix_padded_mask", prefix_padded_mask.shape)
 
         # apply Transformer blocks
         for blk in self.decoder_blocks:
@@ -1096,7 +1086,6 @@ class lang_gen_MAE(nn.Module):
         # predictor projection
         reconstructions = self.decoder_pred(patches)
         generations = self.lang_prediction(lang)
-        # print(reconstructions.shape, generations.shape)
         return reconstructions, generations
 
     def forward_loss(self, imgs, pred, mask, lang, generated_language, lang_gen_mask, lang_gen_weight):
@@ -1131,8 +1120,8 @@ class lang_gen_MAE(nn.Module):
         lang_loss = (lang_example_loss * lang_gen_weight).sum() / (self.eps + lang_gen_weight.sum())  # Divide by 0...
 
         loss = self.mae_weight * reconstruction_loss + self.lm_weight * lang_loss
-        return loss, reconstruction_loss, lang_loss
-
+        return loss
+    
     def forward(self, imgs, lang_con, lang_con_mask, lang_gen, lang_gen_mask, lang_gen_weight, mask_ratio=0.75):
         """
         Run a forward pass through the model, computing the MAE reconstruction loss (language-conditioned if applicable)
@@ -1158,11 +1147,12 @@ class lang_gen_MAE(nn.Module):
         ctx_reconstructions, generated_language = self.forward_decoder(
             visible_ctx_patches, ids_restore, lang_gen_embeddings, lang_gen_mask
         )
+        # print("ctx_reconstructions.shape",ctx_reconstructions.shape)
         # Compute loss for reconstructed patches & generated language
-        loss, reconstruction_loss, lang_loss = self.forward_loss(
+        loss = self.forward_loss(
             imgs, ctx_reconstructions, mask, lang_gen, generated_language, lang_gen_mask, lang_gen_weight)
 
-        return loss, reconstruction_loss, lang_loss
+        return loss, ctx_reconstructions, mask
 
 class MAE_GAN(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
