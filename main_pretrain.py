@@ -35,11 +35,11 @@ from tool import getModelSize, countdown
 from engine_pretrain import train_one_epoch,train_one_epoch_lcond,train_one_epoch_lgen
 from image_text_dl import TextImageDataset
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=250, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
