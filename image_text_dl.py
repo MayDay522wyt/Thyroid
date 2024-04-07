@@ -1,7 +1,10 @@
 # Originally found in https://github.com/lucidrains/DALLE-pytorch
 from pathlib import Path
 from random import randint
+import random
 
+# 设置随机种子为 42
+random.seed(42)
 
 import PIL
 import argparse
@@ -94,24 +97,25 @@ class TextImageDataset(Dataset):
     def fix_img(self, img):
         return img.convert('RGB') if img.mode != 'RGB' else img
 
-    def random_sample(self):
-        return self.__getitem__(randint(0, self.__len__() - 1))
+    # def random_sample(self):
+    #     return self.__getitem__(randint(0, self.__len__() - 1))
 
-    def sequential_sample(self, ind):
-        if ind >= self.__len__() - 1:
-            return self.__getitem__(0)
-        return self.__getitem__(ind + 1)
+    # def sequential_sample(self, ind):
+    #     if ind >= self.__len__() - 1:
+    #         return self.__getitem__(0)
+    #     return self.__getitem__(ind + 1)
 
-    def skip_sample(self, ind):
-        if self.shuffle:
-            return self.random_sample()
-        return self.sequential_sample(ind=ind)
+    # def skip_sample(self, ind):
+    #     if self.shuffle:
+    #         return self.random_sample()
+    #     return self.sequential_sample(ind=ind)
 
     def __getitem__(self, ind):
         key = self.keys[ind]
 
         text_file = self.text_files[key]
         image_file = self.image_files[key]
+        image_name = key
 
         description = text_file
 
@@ -133,7 +137,7 @@ class TextImageDataset(Dataset):
             return self.skip_sample(ind)
 
         # Success
-        return image_tensor, lang, lang_mask
+        return image_tensor, lang, lang_mask, image_file
 
 class TextImageTokenDataset(Dataset):
     def __init__(self,
@@ -169,10 +173,12 @@ class TextImageTokenDataset(Dataset):
     
 from transformers import GPT2Tokenizer
 if __name__ =="__main__":
-    
-    dataset_train = TextImageDataset("/export/home/wuyueting/thyroid_data/CLIPdata_folder/CLIPdata_image_cut_BM_output/","train","feature",custom_tokenizer=GPT2Tokenizer.from_pretrained('gpt2'), max_length = 30)
-    img, lang, lang_mask = dataset_train[1]
-    print(img,lang)
+    data = TextImageTokenDataset(data_path="data/large_vit_coco_gpt2_caption_train.pkl")
+    a,b,c = data[0]
+    print(len(data.img_embeddings))
+    # dataset_train = TextImageDataset("/export/home/wuyueting/thyroid_data/CLIPdata_folder/CLIPdata_image_cut_BM_output/","train","feature",custom_tokenizer=GPT2Tokenizer.from_pretrained('gpt2'), max_length = 30)
+    # img, lang, lang_mask, image_path = dataset_train[1]
+    # print(image_path)
 
     # sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
